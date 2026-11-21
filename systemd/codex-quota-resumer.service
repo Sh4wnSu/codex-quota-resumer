@@ -1,0 +1,24 @@
+[Unit]
+Description=Codex quota resumer (auto-resume sessions paused by usage limits)
+Documentation=file://%h/codex-quota-resumer/ARCHITECTURE.md
+After=network-online.target codex-app-server-daemon.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+UMask=0077
+Environment=HOME=%h
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/codex-quota-resumer
+Restart=always
+RestartSec=15s
+TimeoutStopSec=20s
+# 每个恢复任务是一个脱离会话的子进程（真正的 turn 在 app-server daemon 里跑）。
+# KillMode=process 让 restart/stop 只杀主循环，不连带杀掉正在盯梢的子进程。
+KillMode=process
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

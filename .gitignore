@@ -1,0 +1,19 @@
+# 运行期数据在 ~/.codex/quota-resumer/，不随仓库走
+/.codex/
+/quota-resumer/
+*.sqlite
+*.sqlite-*
+*.jsonl
+*.prompt
+.env
+.env.*
+__pycache__/
+*.py[cod]
+*.log
+.DS_Store
+.venv/
+venv/
+
+# 本地临时产物
+/tmp/
+*.local.json

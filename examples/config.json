@@ -1,0 +1,20 @@
+{
+  "poll_seconds": 120,
+  "poll_seconds_near_reset": 15,
+  "near_reset_window_seconds": 300,
+  "resume_prompt_template": "继续",
+  "max_age_days": 7,
+  "include_subagent_threads": false,
+  "codex_bin": "codex",
+  "resume_timeout_seconds": 21600,
+  "max_parallel_resumes": 2,
+  "max_resumes_per_cycle": 3,
+  "retry_cooldown_seconds": 900,
+  "max_attempts_per_turn": 3,
+  "extra_resume_args": [],
+  "extra_env": {},
+  "transport": "ws",
+  "rpc_timeout_seconds": 45,
+  "dry_run": false,
+  "executor": "auto"
+}

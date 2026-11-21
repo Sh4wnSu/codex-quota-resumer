@@ -1,0 +1,1474 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""codex-quota-resumer
+
+在 Codex 套餐额度（5 小时窗口 / 周窗口）耗尽导致会话被中断后，
+等到额度真正恢复（account/rateLimits/read 的 ordinaryUsageAllowed 变为 true），
+自动把这些被暂停的会话继续跑下去。
+
+设计要点
+--------
+* 额度来源：`codex app-server` 的 JSON-RPC `account/rateLimits/read`（不消耗模型额度）。
+  失败时回退到解析 rollout jsonl 尾部的 token_count.rate_limits 快照。
+* 暂停判定：thread_history_1.sqlite 里该线程**最新**的 turn 是 failed 且
+  error_json 命中额度类错误；再用 rollout 尾部做二次确认（防止竞态）。
+* 恢复方式（两条链路，自动选择）：
+  1) **daemon 模式（默认优先）**：通过 WebSocket 连上常驻 app-server daemon，
+     发 `thread/resume` + `turn/start`。被 daemon 加载的线程可能由它持有 writer 锁
+     （`~/.codex/thread-writer-locks/<thread>.lock`），独立进程 `codex exec` 会报
+     `already has an active writer`，只能走 daemon。
+  2) **exec 模式（回退）**：daemon 不可用时用 `codex exec resume <id> <prompt>`。
+* 幂等：state.json 记录每个线程最后处理的 failed turn_id；恢复前复查 turn 是否变化，
+  避免踩到用户已经手动恢复的会话。
+* 退避：额度未恢复时静默等待到下一个 resets_at；失败则退避重试。
+
+CLI
+---
+  codex-quota-resumer                # 常驻循环（systemd service 用）
+  codex-quota-resumer --once         # 只跑一轮
+  codex-quota-resumer --status       # 打印额度快照 + 当前暂停会话
+  codex-quota-resumer --probe        # 探测 daemon 恢复链路是否可用
+  codex-quota-resumer --dry-run      # 只打印将要执行的动作，不真的跑 codex
+  codex-quota-resumer --thread <id>  # 只检查匹配此前缀的暂停线程
+
+内部模式（由主循环自己拉起，一般不用手动调）：
+  codex-quota-resumer --remote-turn <thread-id> --failed-turn T --rollout R --prompt-file F --cwd D
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import fcntl
+import json
+import math
+import os
+import queue
+import re
+import shlex
+import signal
+import socket
+import sqlite3
+import stat
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from datetime import datetime
+from functools import cache
+
+HOME = os.path.expanduser("~")
+CODEX_HOME = os.path.abspath(os.environ.get("CODEX_HOME") or os.path.join(HOME, ".codex"))
+WORK_DIR = os.path.join(CODEX_HOME, "quota-resumer")
+CONFIG_PATH = os.path.join(WORK_DIR, "config.json")
+STATE_PATH = os.path.join(WORK_DIR, "state.json")
+LOG_PATH = os.path.join(WORK_DIR, "resumer.log")
+LOCK_PATH = os.path.join(WORK_DIR, "resumer.lock")
+RUNS_DIR = os.path.join(WORK_DIR, "runs")
+
+STATE_DB = os.path.join(CODEX_HOME, "state_5.sqlite")
+HISTORY_DB = os.path.join(CODEX_HOME, "thread_history_1.sqlite")
+SESSIONS_DIR = os.path.join(CODEX_HOME, "sessions")
+
+DEFAULT_CONFIG = {
+    # 轮询间隔（秒）：平时 / 临近重置 / 额度恢复后的扫描
+    "poll_seconds": 120,
+    "poll_seconds_near_reset": 15,
+    "near_reset_window_seconds": 300,
+    # 默认恢复提示词。
+    # 想换回详细版就改成带 {last_user_message} 的长模版
+    # （占位符会被替换成 failed turn 里最后一条真实用户请求）。
+    "resume_prompt_template": "继续",
+    # 扫描范围
+    "max_age_days": 7,
+    "include_subagent_threads": False,
+    # 恢复执行
+    "codex_bin": os.path.join(HOME, ".local", "bin", "codex"),
+    "resume_timeout_seconds": 21600,
+    "max_parallel_resumes": 2,       # 并行恢复几个会话；改回 1 可避免两个重任务同时烧穿新窗口
+    "max_resumes_per_cycle": 3,
+    "retry_cooldown_seconds": 900,
+    "max_attempts_per_turn": 3,
+    "extra_resume_args": [],
+    "extra_env": {},
+    # 恢复链路：auto = 优先直连 daemon，不可用时回退 exec
+    "executor": "auto",            # auto | daemon | exec
+    "daemon_sock": None,           # 需要显式指定 unix socket 时填路径
+    # 额度读取
+    "transport": "ws",             # ws(推荐) = 直连 daemon 读额度；stdio = 每次新起 app-server
+    "rpc_timeout_seconds": 45,
+    "dry_run": False,
+}
+
+USAGE_LIMIT_MARKERS = (
+    "usage_limit_exceeded",
+    "usage_limit_reached",
+    "rate_limit_exceeded",
+    "quota_exceeded",
+    "usage limit",
+    "usage limits",
+)
+# 这些不是"用户真实请求"，恢复时不要拿来当上下文锚点
+SYNTHETIC_USER_PREFIXES = (
+    "<environment_context>",
+    "# AGENTS.md instructions",
+    "<user_instructions>",
+    "# Files mentioned by the user",
+)
+
+
+def now_ts() -> float:
+    return time.time()
+
+
+def fmt_epoch(value) -> str:
+    if not value:
+        return "-"
+    try:
+        return datetime.fromtimestamp(int(value)).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(value)
+
+
+_LOG_TO_FILE = False
+
+
+def ensure_private_dir(path: str) -> None:
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    if stat.S_IMODE(os.stat(path).st_mode) != 0o700:
+        os.chmod(path, 0o700)
+
+
+def open_private(path: str, mode: str):
+    def opener(name, flags):
+        return os.open(name, flags | os.O_NOFOLLOW, 0o600)
+
+    fh = open(path, mode, encoding="utf-8", opener=opener)
+    try:
+        if stat.S_IMODE(os.fstat(fh.fileno()).st_mode) != 0o600:
+            os.fchmod(fh.fileno(), 0o600)
+    except BaseException:
+        fh.close()
+        raise
+    return fh
+
+
+def secure_runtime_files() -> None:
+    paths = [CONFIG_PATH, STATE_PATH, LOG_PATH]
+    if os.path.isdir(RUNS_DIR):
+        ensure_private_dir(RUNS_DIR)
+        with os.scandir(RUNS_DIR) as entries:
+            paths.extend(entry.path for entry in entries if entry.name.endswith((".log", ".prompt")))
+    for path in paths:
+        try:
+            mode = os.stat(path, follow_symlinks=False).st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISREG(mode) and stat.S_IMODE(mode) != 0o600:
+            os.chmod(path, 0o600)
+
+
+def log(msg: str) -> None:
+    line = "%s %s" % (datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z"), msg)
+    if _LOG_TO_FILE:
+        try:
+            with open_private(LOG_PATH, "a") as fh:
+                fh.write(line + "\n")
+        except OSError:
+            pass
+    print(line, flush=True)
+
+
+def load_json(path: str, default):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return default
+
+
+def save_json(path: str, data) -> None:
+    ensure_private_dir(os.path.dirname(path))
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(path),
+                                         prefix=os.path.basename(path) + ".", delete=False) as fh:
+            tmp = fh.name
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    finally:
+        if tmp is not None and os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            user = json.load(fh)
+    except FileNotFoundError:
+        if os.path.lexists(CONFIG_PATH):
+            raise
+        return dict(DEFAULT_CONFIG)
+    if not isinstance(user, dict):
+        raise ValueError("配置需要是 JSON 对象")
+    cfg = {**DEFAULT_CONFIG, **user}
+    for key in ("executor", "transport"):
+        choices = ("auto", "daemon", "exec") if key == "executor" else ("ws", "stdio")
+        if cfg[key] not in choices:
+            raise ValueError("%s 必须为 %s" % (key, " / ".join(choices)))
+    for key in ("dry_run", "include_subagent_threads"):
+        if type(cfg[key]) is not bool:
+            raise ValueError("%s 必须为布尔值" % key)
+    for key in ("poll_seconds", "poll_seconds_near_reset", "max_attempts_per_turn",
+                "resume_timeout_seconds", "rpc_timeout_seconds", "max_parallel_resumes",
+                "max_resumes_per_cycle", "near_reset_window_seconds", "retry_cooldown_seconds"):
+        minimum = 0 if key in ("near_reset_window_seconds", "retry_cooldown_seconds") else 1
+        if type(cfg[key]) is not int or cfg[key] < minimum:
+            raise ValueError("%s 必须为至少 %d 的整数" % (key, minimum))
+    age = cfg["max_age_days"]
+    if type(age) not in (int, float) or not math.isfinite(age) or age <= 0:
+        raise ValueError("max_age_days 必须为正数")
+    for key in ("resume_prompt_template", "codex_bin", "daemon_sock"):
+        if not (key == "daemon_sock" and cfg[key] is None) and not isinstance(cfg[key], str):
+            raise ValueError("%s 必须为字符串" % key)
+    args, env = cfg["extra_resume_args"], cfg["extra_env"]
+    if not isinstance(args, list) or any(not isinstance(arg, str) or "\0" in arg for arg in args):
+        raise ValueError("extra_resume_args 必须为字符串数组")
+    if not isinstance(env, dict) or any(not key or "=" in key or "\0" in key
+                                        or not isinstance(value, str) or "\0" in value
+                                        for key, value in env.items()):
+        raise ValueError("extra_env 必须为有效的环境变量映射")
+    return cfg
+
+
+def load_state() -> dict:
+    st = load_json(STATE_PATH, {})
+    if not isinstance(st, dict):
+        st = {}
+    st.setdefault("threads", {})
+    return st
+
+
+def save_state(st: dict) -> None:
+    save_json(STATE_PATH, st)
+
+
+# --------------------------------------------------------------------------
+# app-server JSON-RPC 客户端（用于 daemon 恢复链路）
+# --------------------------------------------------------------------------
+
+# 这些错误说明"线程正被 daemon 里的活动 turn 占用"，属于良性跳过，不该消耗重试次数
+BENIGN_TURN_MARKERS = (
+    "already has an active or pending turn",
+    "already has an active writer",
+    "activeTurnNotSteerable",
+)
+
+
+class WsUnix:
+    """极简 WebSocket 客户端（unix socket 上的 WS），用于直连 codex app-server daemon。
+
+    实测：本机的 `codex app-server proxy` 只连上却不转发任何字节，而 daemon 的控制 socket
+    （~/.codex/app-server-control/app-server-control.sock）实际是 WebSocket 端点，
+    所以这里自己实现握手 + 帧收发，不依赖那个子命令。
+    """
+
+    def __init__(self, path: str, timeout: float = 15.0):
+        self.path = path
+        self.timeout = timeout
+        self.sock = None
+        self._buf = b""
+
+    def connect(self) -> None:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.settimeout(self.timeout)
+            s.connect(self.path)
+            key = base64.b64encode(os.urandom(16)).decode()
+            s.sendall((
+                "GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+                "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+                "Sec-WebSocket-Version: 13\r\n\r\n" % key
+            ).encode())
+            header = bytearray()
+            while not header.endswith(b"\r\n\r\n"):
+                chunk = s.recv(1)
+                if not chunk:
+                    raise RuntimeError("握手期间连接被关闭")
+                header.extend(chunk)
+                if len(header) > 16384:
+                    raise RuntimeError("WebSocket 握手头过长")
+            if header.split(b"\r\n", 1)[0].split()[1:2] != [b"101"]:
+                raise RuntimeError("WebSocket 握手失败: %s" % bytes(header[:200]))
+        except BaseException:
+            s.close()
+            raise
+        self.sock = s
+        self._buf = b""
+
+    def send_text(self, text: str) -> None:
+        payload = text.encode()
+        head = bytearray([0x81])
+        n = len(payload)
+        if n < 126:
+            head.append(0x80 | n)
+        elif n < 65536:
+            head.append(0x80 | 126)
+            head += struct.pack(">H", n)
+        else:
+            head.append(0x80 | 127)
+            head += struct.pack(">Q", n)
+        mask = os.urandom(4)
+        head += mask
+        self.sock.sendall(bytes(head) + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def _read_exact(self, n: int) -> bytes:
+        while len(self._buf) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise EOFError("daemon 关闭了连接")
+            self._buf += chunk
+        out, self._buf = self._buf[:n], self._buf[n:]
+        return out
+
+    def _pong(self, data: bytes) -> None:
+        mask = os.urandom(4)
+        self.sock.sendall(bytes([0x8A, 0x80 | len(data)]) + mask +
+                          bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def recv_text(self, timeout: float = 30.0) -> str:
+        if self.sock:
+            self.sock.settimeout(timeout)
+        fragments = b""
+        while True:
+            b1, b2 = self._read_exact(2)
+            fin, op, masked, ln = b1 >> 7, b1 & 0x0F, b2 >> 7, b2 & 0x7F
+            if ln == 126:
+                ln = struct.unpack(">H", self._read_exact(2))[0]
+            elif ln == 127:
+                ln = struct.unpack(">Q", self._read_exact(8))[0]
+            mask = self._read_exact(4) if masked else None
+            data = self._read_exact(ln)
+            if mask:
+                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+            if op == 0x9:
+                self._pong(data)
+                continue
+            if op == 0xA:
+                continue
+            if op == 0x8:
+                raise EOFError("daemon 关闭了连接")
+            fragments += data
+            if fin:
+                return fragments.decode("utf-8", "replace")
+
+    def close(self) -> None:
+        if self.sock is not None:
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            finally:
+                self.sock.close()
+                self.sock = None
+
+
+class AppServerClient:
+    """与 codex app-server 的 JSON-RPC 会话。
+
+    mode="ws"    直连常驻 daemon 的 unix socket（默认）—— 只有它能续跑被 daemon
+                 持有 writer 锁的线程。
+    mode="stdio" 每次新起一个 `codex app-server` 子进程 —— 用于只读的额度读取兜底。
+    """
+
+    def __init__(self, cfg: dict, mode: str = "ws"):
+        self.cfg = cfg
+        self.mode = mode
+        self.codex_bin = cfg.get("codex_bin") or "codex"
+        self.sock_path = cfg.get("daemon_sock") or os.path.join(
+            CODEX_HOME, "app-server-control", "app-server-control.sock")
+        self.ws: WsUnix | None = None
+        self.proc = None
+        self.reader: threading.Thread | None = None
+        self.inbox: "queue.Queue" = queue.Queue()
+        self.pending: list = []
+        self._next_id = 0
+        self.start_error = ""
+
+    # -- 生命周期 ---------------------------------------------------------
+    def start(self, init_timeout: float = 30) -> bool:
+        if self.mode == "ws":
+            try:
+                self.ws = WsUnix(self.sock_path, timeout=init_timeout)
+                self.ws.connect()
+            except Exception as exc:
+                self.start_error = "连接 daemon socket 失败 (%s): %s" % (self.sock_path, exc)
+                return False
+            self.reader = threading.Thread(target=self._ws_reader, daemon=True)
+        else:
+            env = dict(os.environ)
+            env.setdefault("CODEX_HOME", CODEX_HOME)
+            env["RUST_LOG"] = "error"
+            try:
+                self.proc = subprocess.Popen(
+                    [self.codex_bin, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, env=env,
+                )
+            except Exception as exc:
+                self.start_error = "启动失败: %s" % exc
+                return False
+
+            self.reader = threading.Thread(target=self._stdio_reader, daemon=True)
+        self.reader.start()
+        ok, res = self.call("initialize",
+                            {"clientInfo": {"name": "codex-quota-resumer", "version": "2.0.0"}},
+                            timeout=init_timeout)
+        if not ok:
+            self.start_error = json.dumps(res, ensure_ascii=False)[:300]
+            return False
+        self.start_error = self._send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+        return not self.start_error
+
+    def _enqueue(self, text: str) -> None:
+        try:
+            msg = json.loads(text)
+        except ValueError:
+            return
+        if isinstance(msg, dict):
+            self.inbox.put(msg)
+
+    def _stdio_reader(self) -> None:
+        try:
+            for line in self.proc.stdout:
+                self._enqueue(line)
+        except (OSError, UnicodeError, ValueError):
+            pass
+        finally:
+            self.inbox.put({"__eof__": True})
+
+    def _ws_reader(self) -> None:
+        try:
+            while True:
+                self._enqueue(self.ws.recv_text(timeout=3600))
+        except Exception as exc:
+            self.inbox.put({"__eof__": True, "message": str(exc)})
+
+    def stop(self) -> None:
+        if self.ws:
+            self.ws.close()
+        if self.proc:
+            if self.proc.poll() is None:
+                self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+            try:
+                self.proc.stdin.close()
+            except BrokenPipeError:
+                pass
+        if self.reader:
+            self.reader.join(timeout=1)
+        if self.proc and (not self.reader or not self.reader.is_alive()):
+            self.proc.stdout.close()
+
+    # -- 收发 -------------------------------------------------------------
+    def _send(self, obj: dict) -> str:
+        try:
+            if self.ws:
+                self.ws.send_text(json.dumps(obj))
+            elif self.proc:
+                self.proc.stdin.write(json.dumps(obj) + "\n")  # type: ignore[union-attr]
+                self.proc.stdin.flush()  # type: ignore[union-attr]
+            else:
+                return "连接未建立"
+        except OSError as exc:
+            return "发送失败: %s" % exc
+        return ""
+
+    def _next(self, timeout: float):
+        try:
+            return self.inbox.get(timeout=max(0.05, timeout))
+        except queue.Empty:
+            return None
+
+    def next_message(self, timeout: float):
+        """取下一条**通知**（非本次请求的响应）。"""
+        if self.pending:
+            return self.pending.pop(0)
+        return self._next(timeout)
+
+    def call(self, method: str, params, timeout: float = 60):
+        """发请求并等响应，返回 (ok: bool, result_or_error)。等待期间收到的通知存进 pending。"""
+        self._next_id += 1
+        req_id = self._next_id
+        error = self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
+        if error:
+            return False, {"message": error}
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            msg = self._next(deadline - time.monotonic())
+            if msg is None:
+                continue
+            if "__eof__" in msg:
+                return False, {"message": "连接已断开: %s" % (msg.get("message") or "app-server 关闭了连接")}
+            if msg.get("id") == req_id:
+                if "error" in msg:
+                    return False, msg["error"]
+                return True, msg.get("result")
+            self.pending.append(msg)
+        return False, {"message": "RPC %s 超时" % method}
+
+
+_DAEMON_CACHE = {"at": 0.0, "ok": False, "err": ""}
+
+
+def daemon_available(cfg: dict, ttl: float = 120.0) -> bool:
+    """探测常驻 app-server daemon 能否连上（结果缓存 ttl 秒）。"""
+    now = now_ts()
+    if _DAEMON_CACHE["at"] and (now - _DAEMON_CACHE["at"]) < ttl:
+        return bool(_DAEMON_CACHE["ok"])
+    client = AppServerClient(cfg, mode="ws")
+    try:
+        ok = client.start(init_timeout=min(20, cfg["rpc_timeout_seconds"]))
+        err = client.start_error
+    finally:
+        client.stop()
+    _DAEMON_CACHE.update({"at": now, "ok": ok, "err": err})
+    if not ok:
+        log("  ! daemon 不可用（%s），本次回退 exec 模式" % (err or "未知原因"))
+    return ok
+
+
+def choose_executor(cfg: dict) -> str:
+    mode = str(cfg.get("executor") or "auto")
+    if mode == "exec":
+        return "exec"
+    if mode == "daemon":
+        return "daemon"
+    return "daemon" if daemon_available(cfg) else "exec"
+
+
+def run_remote_turn(cfg: dict, thread_id: str, failed_turn_id: str, rollout_path: str,
+                    prompt: str, cwd: str) -> int:
+    """内部模式：连 daemon，resume 线程并起一个 turn，盯着它跑完。"""
+    def w(text: str) -> None:
+        line = "%s %s" % (datetime.now().astimezone().strftime("%H:%M:%S"), text)
+        print(line, flush=True)
+
+    client = AppServerClient(cfg, mode="ws")
+    try:
+        if not client.start(init_timeout=cfg["rpc_timeout_seconds"]):
+            w("! 无法连接 app-server daemon: %s" % (client.start_error or "未知"))
+            return 3
+        ok, res = client.call("thread/resume", {"threadId": thread_id, "cwd": cwd}, timeout=120)
+        if not ok:
+            msg = json.dumps(res, ensure_ascii=False)
+            w("! thread/resume 失败: %s" % msg[:400])
+            return 4 if any(m in msg for m in BENIGN_TURN_MARKERS) else 3
+        w("thread/resume ok (cwd=%s)" % cwd)
+
+        still, reason = rollout_still_paused(rollout_path, failed_turn_id)
+        if not still:
+            w("! 跳过 turn/start: %s" % reason)
+            return 4
+        ok, res = client.call("turn/start", {
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": prompt}],
+            "cwd": cwd,
+        }, timeout=120)
+        if not ok:
+            msg = json.dumps(res, ensure_ascii=False)
+            w("! turn/start 失败: %s" % msg[:400])
+            return 4 if any(m in msg for m in BENIGN_TURN_MARKERS) else 3
+        turn = res.get("turn") if isinstance(res, dict) else None
+        turn_id = turn.get("id") if isinstance(turn, dict) else None
+        if not isinstance(turn_id, str) or not turn_id:
+            w("! turn/start 响应缺少 turn ID")
+            return 3
+        w("turn 已启动: %s (status=%s)" % (turn_id, turn.get("status")))
+
+        deadline = time.monotonic() + cfg["resume_timeout_seconds"]
+        while time.monotonic() < deadline:
+            msg = client.next_message(timeout=min(300.0, deadline - time.monotonic()))
+            if msg is None:
+                w("... 暂无事件，继续等待")
+                continue
+            if "__eof__" in msg:
+                w("! daemon 连接关闭（turn 可能仍在后台继续）")
+                return 6
+            method = msg.get("method")
+            params = msg.get("params") or {}
+            if not isinstance(params, dict) or params.get("threadId") != thread_id:
+                continue
+            event_turn = params.get("turn")
+            if not isinstance(event_turn, dict):
+                event_turn = {}
+            if (event_turn.get("id") or params.get("turnId")) != turn_id:
+                continue
+            if method == "turn/completed":
+                state = event_turn.get("status") or "?"
+                w("turn/completed status=%s" % state)
+                return 0 if state == "completed" else 5
+            if method == "error" and not params.get("willRetry"):
+                w("! turn 报错: %s" % json.dumps(params, ensure_ascii=False)[:400])
+                continue
+            if method in ("item/agentMessage/delta", "item/reasoning/summaryTextDelta",
+                          "item/reasoning/textDelta", "item/commandExecution/outputDelta",
+                          "item/plan/delta", "thread/tokenUsage/updated"):
+                continue
+            w("  %s %s" % (method, json.dumps(params, ensure_ascii=False)[:240]))
+        w("! 超过 resume_timeout_seconds，退出等待（turn 可能仍在跑）")
+        return 6
+    finally:
+        client.stop()
+
+
+# --------------------------------------------------------------------------
+# 额度快照
+# --------------------------------------------------------------------------
+
+class RateLimitReader:
+    """读取 account/rateLimits/read。
+
+    transport=ws 时直连常驻 daemon（便宜、毫秒级）；失败或 transport=stdio 时
+    回退到每次新起一个 `codex app-server` 子进程。
+    """
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.transport = cfg["transport"]
+        self.timeout = cfg["rpc_timeout_seconds"]
+
+    def _call(self, mode: str) -> dict | None:
+        client = AppServerClient(self.cfg, mode=mode)
+        try:
+            init_timeout = min(20, self.timeout) if mode == "ws" else self.timeout
+            if not client.start(init_timeout=init_timeout):
+                log("  ! 额度 RPC (%s) 初始化失败: %s" % (mode, client.start_error))
+                return None
+            ok, res = client.call("account/rateLimits/read", {}, timeout=self.timeout)
+            if not ok:
+                log("  ! 额度 RPC (%s) 失败: %s" % (mode, json.dumps(res, ensure_ascii=False)[:200]))
+            return res if ok and isinstance(res, dict) else None
+        finally:
+            client.stop()
+
+    def read(self) -> dict | None:
+        res = self._call(self.transport)
+        if not res and self.transport == "ws":
+            res = self._call("stdio")
+        if res is None:
+            return None
+        snaps = res.get("rateLimitsByLimitId")
+        if not isinstance(snaps, dict):
+            snaps = {}
+        snap = snaps.get("codex")
+        if not isinstance(snap, dict):
+            snap = None
+        if snap is None and isinstance(res.get("rateLimits"), dict):
+            snap = res["rateLimits"]
+        if snap is None:
+            snap = next((value for value in snaps.values() if isinstance(value, dict)), None)
+        if snap is None and type(res.get("ordinaryUsageAllowed")) is not bool:
+            return None
+        snap = snap or {}
+        credits = res.get("rateLimitResetCredits")
+        upsell = res.get("rateLimitUpsell")
+        return {
+            "source": "rpc",
+            "fetched_at": now_ts(),
+            "account_id": res.get("accountId"),
+            "ordinary_usage_allowed": res.get("ordinaryUsageAllowed"),
+            "primary": snap.get("primary"),
+            "secondary": snap.get("secondary"),
+            "plan_type": snap.get("planType"),
+            "reached_type": snap.get("rateLimitReachedType"),
+            "spend_control_reached": snap.get("spendControlReached"),
+            "reset_credits": credits.get("availableCount") if isinstance(credits, dict) else None,
+            "upsell_reset_at": upsell.get("reset_at") if isinstance(upsell, dict) else None,
+            "limit_id": snap.get("limitId"),
+        }
+
+
+def read_rollout_snapshot() -> dict | None:
+    """兜底：从最新的 rollout 尾部读 token_count.rate_limits。"""
+    newest, newest_mtime = None, 0.0
+    for root, _dirs, files in os.walk(SESSIONS_DIR):
+        for name in files:
+            if not name.endswith(".jsonl"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if mtime > newest_mtime:
+                newest, newest_mtime = path, mtime
+    if not newest:
+        return None
+    snap = None
+    try:
+        size = os.path.getsize(newest)
+        with open(newest, "rb") as fh:
+            fh.seek(max(0, size - 512 * 1024))
+            chunk = fh.read().decode("utf-8", "replace")
+        for line in chunk.splitlines():
+            if '"rate_limits"' not in line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            payload = obj.get("payload") or {}
+            rl = payload.get("rate_limits")
+            if rl and (rl.get("primary") or rl.get("secondary")):
+                snap = rl
+    except Exception:
+        return None
+    if not snap:
+        return None
+    return {
+        "source": "rollout",
+        "fetched_at": newest_mtime,
+        "account_id": None,
+        "ordinary_usage_allowed": None,
+        "primary": _convert_window(snap.get("primary")),
+        "secondary": _convert_window(snap.get("secondary")),
+        "plan_type": snap.get("plan_type"),
+        "reached_type": snap.get("rate_limit_reached_type"),
+        "spend_control_reached": None,
+        "reset_credits": None,
+        "upsell_reset_at": None,
+        "limit_id": snap.get("limit_id"),
+    }
+
+
+def _convert_window(win) -> dict | None:
+    if not win:
+        return None
+    return {
+        "usedPercent": win.get("used_percent"),
+        "windowDurationMins": win.get("window_minutes"),
+        "resetsAt": win.get("resets_at"),
+    }
+
+
+def usage_blocked(snap: dict) -> bool:
+    return snap.get("ordinary_usage_allowed") is not True
+
+
+def next_reset_epoch(snap: dict) -> int | None:
+    """返回解除阻塞最相关的 resets_at（周窗口优先于 5 小时窗口）。"""
+    candidates = []
+    for key in ("primary", "secondary"):
+        win = snap.get(key) or {}
+        used = win.get("usedPercent")
+        resets = win.get("resetsAt")
+        if used is not None and float(used) >= 99.5 and resets:
+            candidates.append(int(resets))
+    if candidates:
+        return min(candidates)
+    return None
+
+
+def describe(snap: dict) -> str:
+    def part(win, label):
+        if not win:
+            return "%s=-" % label
+        return "%s=%.0f%%/%.0fmin/reset %s" % (
+            label,
+            float(win.get("usedPercent") or 0),
+            float(win.get("windowDurationMins") or 0),
+            fmt_epoch(win.get("resetsAt")),
+        )
+    return "[%s] allowed=%s plan=%s reached=%s | %s | %s | reset_credits=%s" % (
+        snap.get("source"),
+        snap.get("ordinary_usage_allowed"),
+        snap.get("plan_type"),
+        snap.get("reached_type"),
+        part(snap.get("primary"), "5h"),
+        part(snap.get("secondary"), "week"),
+        snap.get("reset_credits"),
+    )
+
+
+# --------------------------------------------------------------------------
+# 暂停会话发现
+# --------------------------------------------------------------------------
+
+def _connect_ro(path: str) -> sqlite3.Connection | None:
+    if not os.path.exists(path):
+        return None
+    try:
+        conn = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=15)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except Exception as exc:
+        log("  ! 打开 %s 失败: %s" % (os.path.basename(path), exc))
+        return None
+
+
+def is_usage_limit_error(error_json: str | None) -> bool:
+    if not error_json:
+        return False
+    low = error_json.lower()
+    return any(marker in low for marker in USAGE_LIMIT_MARKERS)
+
+
+def find_paused_threads(max_age_days: float, include_subagents: bool) -> list[dict]:
+    st = _connect_ro(STATE_DB)
+    hs = _connect_ro(HISTORY_DB)
+    if st is None or hs is None:
+        if st:
+            st.close()
+        if hs:
+            hs.close()
+        return []
+    out: list[dict] = []
+    try:
+        threads = {row["id"]: dict(row) for row in st.execute(
+            "select id, cwd, title, source, originator, archived, updated_at, rollout_path, tokens_used "
+            "from threads where archived = 0"
+        )}
+        rows = hs.execute(
+            """
+            SELECT thread_id, turn_id, status, error_json,
+                   COALESCE(completed_at, started_at) AS ts, started_at, completed_at
+            FROM (
+                SELECT thread_id, turn_id, status, error_json, started_at, completed_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY thread_id
+                           ORDER BY COALESCE(completed_at, started_at) DESC
+                       ) AS rn
+                FROM thread_turns
+            )
+            WHERE rn = 1
+            """
+        ).fetchall()
+    finally:
+        st.close()
+        hs.close()
+
+    cutoff = now_ts() - max_age_days * 86400
+    for row in rows:
+        tid = row["thread_id"]
+        if row["status"] != "failed" or not is_usage_limit_error(row["error_json"]):
+            continue
+        thread = threads.get(tid)
+        if not thread:
+            continue
+        source = str(thread.get("source") or "")
+        if not include_subagents and "subagent" in source:
+            continue
+        updated = thread.get("updated_at") or 0
+        if cutoff and updated and float(updated) < cutoff:
+            continue
+        out.append({
+            "thread_id": tid,
+            "turn_id": row["turn_id"],
+            "error": (row["error_json"] or "")[:400],
+            "failed_at": row["ts"],
+            "cwd": thread.get("cwd"),
+            "title": (thread.get("title") or "")[:80],
+            "source": source[:40],
+            "originator": thread.get("originator"),
+            "rollout_path": thread.get("rollout_path"),
+            "updated_at": updated,
+        })
+    out.sort(key=lambda item: item["failed_at"] or 0, reverse=True)
+    return out
+
+
+def rollout_still_paused(rollout_path: str | None, failed_turn_id: str) -> tuple[bool, str]:
+    """确认 rollout 的最后一条 turn 事件是索引指向的额度中断。"""
+    if not rollout_path or not failed_turn_id:
+        return False, "缺少 rollout 路径或失败 turn ID"
+    try:
+        with open(rollout_path, "rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            # 普通文件只读 256 KiB，末尾有大条目时扩大一次窗口。
+            for tail_bytes in (256 * 1024, 2 * 1024 * 1024):
+                offset = max(0, size - tail_bytes)
+                fh.seek(max(0, offset - 1))
+                chunk = fh.read(size - fh.tell())
+                if fh.seek(0, os.SEEK_END) != size or (chunk and not chunk.endswith(b"\n")):
+                    return False, "rollout 仍在写入"
+                if offset:
+                    chunk = chunk.partition(b"\n")[2]
+                for line in reversed(chunk.split(b"\n")):
+                    event = rollout_turn_event(line)
+                    if event:
+                        return confirm_failed_turn(event, failed_turn_id)
+                if not offset:
+                    break
+    except OSError as exc:
+        return False, "读取 rollout 失败: %s" % exc
+    except ValueError:
+        return False, "rollout 中有无法解析的 turn 事件"
+    return False, "rollout 尾部未见 turn 事件"
+
+
+def rollout_turn_event(line: bytes) -> dict | None:
+    if not any(marker in line for marker in (b'"task_started"', b'"task_complete"', b'"turn_aborted"')):
+        return None
+    obj = json.loads(line)
+    if not isinstance(obj, dict) or obj.get("type") != "event_msg":
+        return None
+    event = obj.get("payload")
+    if isinstance(event, dict) and event.get("type") in ("task_started", "task_complete", "turn_aborted"):
+        return event
+    return None
+
+
+def confirm_failed_turn(event: dict, failed_turn_id: str) -> tuple[bool, str]:
+    if event.get("turn_id") != failed_turn_id:
+        return False, "rollout 最新 turn 与索引中的失败 turn 不一致"
+    kind = event["type"]
+    err = event.get("error")
+    if kind == "task_complete" and isinstance(err, dict) and err.get("codex_error_info") in (
+        "usage_limit_exceeded", "usage_limit_reached", "rate_limit_exceeded", "quota_exceeded",
+    ):
+        return True, "rollout 尾部确认：仍停在额度中断"
+    return False, "rollout 最新 turn 事件 %s 未确认额度中断" % kind
+
+
+def last_user_message(thread_id: str, turn_id: str | None) -> str | None:
+    """取该 failed turn 里最后一条真实用户消息。"""
+    hs = _connect_ro(HISTORY_DB)
+    if hs is None:
+        return None
+    try:
+        sql = ("select turn_id, item_json from thread_items "
+               "where thread_id = ? and item_type = 'userMessage' order by rollout_ordinal desc limit 40")
+        rows = hs.execute(sql, (thread_id,)).fetchall()
+    except Exception:
+        rows = []
+    finally:
+        hs.close()
+
+    def extract(item_json: str) -> str:
+        try:
+            obj = json.loads(item_json)
+        except Exception:
+            return ""
+        parts = []
+        for content in obj.get("content") or []:
+            if isinstance(content, dict) and content.get("type") == "text":
+                parts.append(content.get("text") or "")
+        return "\n".join(p for p in parts if p).strip()
+
+    preferred, fallback = [], []
+    for row in rows:
+        text = extract(row["item_json"])
+        if not text:
+            continue
+        if any(text.startswith(prefix) for prefix in SYNTHETIC_USER_PREFIXES):
+            continue
+        if turn_id and row["turn_id"] == turn_id:
+            preferred.append(text)
+        else:
+            fallback.append(text)
+    if preferred:
+        return preferred[0]
+    if fallback:
+        return fallback[0]
+    return None
+
+
+# --------------------------------------------------------------------------
+# 恢复执行
+# --------------------------------------------------------------------------
+
+def build_prompt(cfg: dict, message: str | None) -> str:
+    """恢复提示词完全由 config.resume_prompt_template 决定（默认就是「继续」）。
+
+    不再有"详细版兜底"分支 —— 如果模版里没有 {last_user_message} 占位符，
+    就直接原样发出，保证发出去的内容可预期。
+    """
+    template = cfg.get("resume_prompt_template")
+    if not template:
+        template = DEFAULT_CONFIG["resume_prompt_template"]
+    return template.replace("{last_user_message}", message or "")
+
+
+def spawn_resume(cfg: dict, item: dict, prompt: str, state: dict, dry_run: bool) -> dict | None:
+    tid = item["thread_id"]
+    cwd = item.get("cwd") or HOME
+    if not os.path.isdir(cwd):
+        log("  ! 跳过 %s：cwd 不存在 %s" % (tid[:8], cwd))
+        return None
+    executor = choose_executor(cfg)
+    if dry_run:
+        log("  [dry-run][%s] 续跑 %s <prompt %d 字>" % (executor, tid, len(prompt)))
+        return None
+
+    env = dict(os.environ)
+    env.setdefault("CODEX_HOME", CODEX_HOME)
+    env.update(cfg.get("extra_env") or {})
+    env["PATH"] = os.pathsep.join([
+        os.path.join(HOME, ".local", "bin"),
+        env.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+    ])
+    ensure_private_dir(RUNS_DIR)
+    stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    prompt_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=RUNS_DIR,
+                                         prefix="%s-%s-" % (tid[:8], stamp),
+                                         suffix=".log", delete=False) as handle:
+            log_path = handle.name
+            if executor == "daemon":
+                prompt_path = log_path + ".prompt"
+                with open_private(prompt_path, "x") as fh:
+                    fh.write(prompt)
+                cmd = [sys.executable, os.path.abspath(__file__), "--remote-turn", tid, "--cwd", cwd,
+                       "--prompt-file", prompt_path, "--failed-turn", item["turn_id"],
+                       "--rollout", os.path.abspath(item["rollout_path"])]
+            else:
+                cmd = [cfg.get("codex_bin") or "codex", "exec", "resume", tid, prompt, "--skip-git-repo-check"]
+                cmd += cfg["extra_resume_args"]
+            handle.write("=== executor=%s ===\n$ %s\n\n" % (executor, " ".join(shlex.quote(c) for c in cmd)))
+            handle.flush()
+            if executor == "exec":
+                still, reason = rollout_still_paused(item.get("rollout_path"), item["turn_id"])
+                if not still:
+                    log("  - 跳过 %s（%s）" % (tid[:8], reason))
+                    return None
+            proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                    stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
+    except (OSError, ValueError) as exc:
+        if prompt_path and os.path.exists(prompt_path):
+            os.unlink(prompt_path)
+        log("  ! 启动 resume 失败 %s: %s" % (tid[:8], exc))
+        return None
+    _, start_ticks = read_process(proc.pid)
+    log("  → 已启动 resume(%s) %s (pid=%d) cwd=%s 日志=%s" % (executor, tid[:8], proc.pid, cwd, log_path))
+    previous = state["threads"].get(tid, {})
+    same_turn = previous.get("last_failed_turn_id") == item["turn_id"]
+    state["threads"][tid] = {
+        "last_failed_turn_id": item["turn_id"],
+        "resumed_at": now_ts(),
+        "pid": proc.pid,
+        "pid_start_ticks": start_ticks,
+        "pid_boot_id": boot_id(),
+        "log": log_path,
+        "cwd": cwd,
+        "executor": executor,
+        "status": "running",
+        "attempts": int(previous.get("attempts") or 0) + 1 if same_turn else 1,
+    }
+    save_state(state)
+    return {"pid": proc.pid, "log": log_path}
+
+
+def log_tail_has_benign(log_path: str | None, tail_bytes: int = 8192) -> str:
+    """检查一次恢复的日志尾部是否命中"良性跳过"标记，命中则返回标记本身。"""
+    if not log_path or not os.path.exists(log_path):
+        return ""
+    try:
+        size = os.path.getsize(log_path)
+        with open(log_path, "rb") as fh:
+            fh.seek(max(0, size - tail_bytes))
+            text = fh.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+    for marker in BENIGN_TURN_MARKERS + ("跳过 turn/start:",):
+        if marker in text:
+            return marker
+    return ""
+
+
+@cache
+def boot_id() -> str | None:
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+def read_process(pid: int) -> tuple[str, int | None]:
+    try:
+        with open("/proc/%d/stat" % pid, "r", encoding="utf-8", errors="replace") as fh:
+            fields = fh.read().rsplit(")", 1)[1].split()
+        # 剩余字段从 state（字段 3）开始，starttime 是字段 22。
+        status = "zombie" if fields[0] in ("Z", "X", "x") else "alive"
+        return status, int(fields[19])
+    except FileNotFoundError:
+        return "gone", None
+    except (OSError, IndexError, ValueError):
+        return "unverified", None
+
+
+def monitor_state(entry: dict) -> str:
+    pid = entry.get("pid")
+    if type(pid) is not int or pid <= 0:
+        return "gone"
+    saved_boot = entry.get("pid_boot_id")
+    current_boot = boot_id()
+    if saved_boot and current_boot and saved_boot != current_boot:
+        return "reused"
+    status, ticks = read_process(pid)
+    expected = entry.get("pid_start_ticks")
+    if expected is not None and ticks is not None and ticks != expected:
+        return "reused"
+    if status == "alive" and (expected is None or not saved_boot or not current_boot):
+        return "unverified"
+    return status
+
+
+def signal_monitor(entry: dict, sig: signal.Signals) -> bool:
+    if monitor_state(entry) != "alive":
+        return False
+    pid = entry["pid"]
+    try:
+        # start_new_session=True makes the monitor its own process group leader.
+        if os.getpgid(pid) != pid or monitor_state(entry) != "alive":
+            return False
+        os.killpg(pid, sig)
+    except OSError:
+        return False
+    return True
+
+
+def reap_if_child(pid: int) -> None:
+    """如果僵尸是我们的直接子进程就回收掉（不是的话 ECHILD，忽略）。"""
+    try:
+        os.waitpid(int(pid), os.WNOHANG)
+    except Exception:
+        pass
+
+
+def monitor_finished_at(entry: dict) -> float:
+    """用监控日志的最后写入时间作为真实结束时间，避免把 finished_at 记成"现在"
+    而无谓地触发 retry_cooldown。"""
+    path = entry.get("log")
+    try:
+        if path and os.path.exists(path):
+            return max(float(entry.get("resumed_at") or 0), os.path.getmtime(path))
+    except Exception:
+        pass
+    return now_ts()
+
+
+def reconcile_running(state: dict, cfg: dict, *, dry_run: bool = False) -> None:
+    """清理已结束的 resume 进程状态，并对超时的恢复进程做终止。"""
+    changed = False
+    for tid, entry in state.get("threads", {}).items():
+        if entry.get("status") != "running":
+            continue
+        pid = entry.get("pid")
+        st = monitor_state(entry)
+        if st in ("gone", "zombie", "reused"):
+            if st == "zombie" and not dry_run:
+                reap_if_child(int(pid))
+            entry["status"] = "finished"
+            entry["finished_at"] = now_ts() if entry.get("last_error") == "timeout" else monitor_finished_at(entry)
+            entry["exit_detect"] = st
+            changed = True
+            benign = log_tail_has_benign(entry.get("log"))
+            if benign:
+                # 线程正被别的 turn 占用：不算失败，把这次尝试次数退回去
+                entry["attempts"] = max(0, int(entry.get("attempts") or 1) - 1)
+                entry["benign_skip"] = benign
+                log("  ✓ resume 进程结束 %s (pid=%s, %s) —— 良性跳过(%s)，尝试次数回退为 %d"
+                    % (tid[:8], pid, st, benign, entry["attempts"]))
+            else:
+                log("  ✓ resume 进程结束 %s (pid=%s, %s) 日志=%s" % (tid[:8], pid, st, entry.get("log")))
+            continue
+        # 进程仍活着：检查是否超过单次恢复的时长上限
+        timeout = cfg["resume_timeout_seconds"]
+        started = float(entry.get("resumed_at") or 0)
+        if not dry_run and (not started or (now_ts() - started) > timeout):
+            entry["last_error"] = "timeout"
+            changed = True
+            if signal_monitor(entry, signal.SIGTERM):
+                log("  ! resume %s (pid=%s) 超过 %ds 上限，已发出 SIGTERM" % (tid[:8], pid, timeout))
+                time.sleep(3)
+                signal_monitor(entry, signal.SIGKILL)
+                # 下一轮统一回收退出的进程，仍活着的进程继续占用槽位。
+                continue
+            log("  ! resume %s (pid=%s) 超时，未向无法确认的进程组发送信号" % (tid[:8], pid))
+            entry["status"] = "finished"
+            entry["finished_at"] = now_ts()
+    if changed and not dry_run:
+        save_state(state)
+
+
+# --------------------------------------------------------------------------
+# 主循环
+# --------------------------------------------------------------------------
+
+def snapshot(cfg: dict) -> dict | None:
+    reader = RateLimitReader(cfg)
+    snap = reader.read()
+    if snap is None:
+        snap = read_rollout_snapshot()
+        if snap:
+            log("  ! RPC 读取失败，显示 rollout 历史额度")
+    return snap
+
+
+def collect_targets(cfg: dict, state: dict, snap: dict, only_thread: str | None = None
+                    ) -> tuple[bool, list[dict], list[tuple[dict, str]]]:
+    """返回 (额度是否可用, 可恢复列表, 被跳过的列表)。"""
+    if usage_blocked(snap):
+        return False, [], []
+    paused = find_paused_threads(cfg["max_age_days"], cfg["include_subagent_threads"])
+    ready, skipped = [], []
+    cooldown = cfg["retry_cooldown_seconds"]
+    max_attempts = cfg["max_attempts_per_turn"]
+    for item in paused:
+        tid = item["thread_id"]
+        if only_thread and not tid.startswith(only_thread):
+            continue
+        entry = state["threads"].get(tid) or {}
+        status = entry.get("status")
+        if status == "running":
+            skipped.append((item, "上一次恢复仍在运行 (pid=%s)" % entry.get("pid")))
+            continue
+        if entry.get("last_failed_turn_id") == item["turn_id"]:
+            if status == "done":
+                skipped.append((item, "该 turn 已处理 (status=%s)" % status))
+                continue
+            if status in ("finished", "parked"):
+                if int(entry.get("attempts") or 0) >= max_attempts:
+                    entry["status"] = "parked"
+                    skipped.append((item, "该 turn 已达 %d 次尝试上限 (parked)" % max_attempts))
+                    continue
+                since = now_ts() - float(entry.get("finished_at") or 0)
+                if since < cooldown:
+                    skipped.append((item, "恢复冷却中，还剩 %ds" % int(cooldown - since)))
+                    continue
+        still, why = rollout_still_paused(item.get("rollout_path"), item["turn_id"])
+        if not still:
+            skipped.append((item, why))
+            continue
+        item["reason"] = why
+        ready.append(item)
+    return True, ready, skipped
+
+
+def run_loop(cfg: dict, once: bool, only_thread: str | None, dry_run: bool,
+             *, force_allowed: bool = False) -> int:
+    state = load_state()
+    log("codex-quota-resumer 启动 (dry_run=%s, once=%s, transport=%s, poll=%ss)" %
+        (dry_run, once, cfg.get("transport"), cfg.get("poll_seconds")))
+    consecutive_failures = 0
+    while True:
+        reconcile_running(state, cfg, dry_run=dry_run)
+        if dry_run and force_allowed:
+            snap = {"ordinary_usage_allowed": True, "source": "simulation"}
+        else:
+            snap = snapshot(cfg)
+        if snap is not None:
+            state["last_snapshot"] = snap
+        if snap is None or type(snap.get("ordinary_usage_allowed")) is not bool:
+            if snap is not None and not dry_run:
+                save_state(state)
+            consecutive_failures += 1
+            backoff = min(600, 30 * consecutive_failures)
+            if snap is not None:
+                log("  ! 额度状态未知，%s；%ds 后重试" % (describe(snap), backoff))
+            else:
+                log("  ! 无法获取额度快照，%ds 后重试" % backoff)
+            if once:
+                return 2
+            time.sleep(backoff)
+            continue
+        consecutive_failures = 0
+
+        if usage_blocked(snap):
+            if not dry_run:
+                save_state(state)
+            reset = next_reset_epoch(snap)
+            near_window = cfg["near_reset_window_seconds"]
+            if reset:
+                remaining = reset - now_ts()
+                # 远离重置点：最多睡 15 分钟（额度也可能被手动消耗 reset credit 提前解封）；
+                # 进入重置窗口后按配置加快轮询。
+                if remaining <= near_window:
+                    wait = cfg["poll_seconds_near_reset"]
+                    if remaining > 0:
+                        wait = min(wait, math.ceil(remaining))
+                else:
+                    wait = min(900, math.ceil(remaining - near_window))
+            else:
+                wait = cfg["poll_seconds"]
+            log("额度不可用，%s；等待 %ds" % (describe(snap), wait))
+            if once:
+                return 0
+            time.sleep(wait)
+            continue
+
+        running = sum(1 for e in state["threads"].values() if e.get("status") == "running")
+        _allowed, ready, skipped = collect_targets(cfg, state, snap, only_thread)
+        if not dry_run:
+            save_state(state)
+        for item, why in skipped:
+            log("  - 跳过 %s（%s）" % (item["thread_id"][:8], why))
+        log("额度可用，%s；待恢复 %d 个，运行中 %d 个" % (describe(snap), len(ready), running))
+
+        budget = max(0, cfg["max_parallel_resumes"] - running)
+        budget = min(budget, cfg["max_resumes_per_cycle"])
+        use_last_message = "{last_user_message}" in cfg["resume_prompt_template"]
+        for item in ready[:budget]:
+            message = last_user_message(item["thread_id"], item["turn_id"]) if use_last_message else None
+            prompt = build_prompt(cfg, message)
+            log("  ★ %s %s cwd=%s turn=%s" % (
+                "计划恢复" if dry_run else "恢复", item["thread_id"][:8], item.get("cwd"), item["turn_id"][:8]))
+            spawn_resume(cfg, item, prompt, state, dry_run)
+        if once:
+            return 0
+        time.sleep(cfg["poll_seconds"])
+
+
+def print_status(cfg: dict) -> int:
+    snap = snapshot(cfg)
+    if not snap:
+        print("无法获取额度快照")
+        return 2
+    print("额度快照：")
+    print("  " + describe(snap))
+    reset = next_reset_epoch(snap)
+    if reset:
+        left = max(0, reset - now_ts())
+        print("  下一次相关重置：%s（还有 %.0f 分钟）" % (fmt_epoch(reset), left / 60.0))
+    if snap.get("upsell_reset_at"):
+        print("  后端 upsell.reset_at：%s" % fmt_epoch(snap.get("upsell_reset_at")))
+    state = load_state()
+    paused = find_paused_threads(cfg["max_age_days"], cfg["include_subagent_threads"])
+    print("\n因额度中断的会话（索引视图，最多 %s 天，子 agent=%s）：" %
+          (cfg.get("max_age_days"), cfg.get("include_subagent_threads")))
+    if not paused:
+        print("  （无）")
+    for item in paused:
+        still, why = rollout_still_paused(item.get("rollout_path"), item["turn_id"])
+        entry = state["threads"].get(item["thread_id"]) or {}
+        print("  - %s  失败于 %s" % (item["thread_id"], fmt_epoch(item["failed_at"])))
+        print("      cwd      : %s" % item.get("cwd"))
+        print("      title    : %s" % item.get("title"))
+        print("      turn     : %s  仍暂停=%s (%s)" % ((item.get("turn_id") or "")[:8], still, why))
+        print("      已处理   : %s" % (json.dumps({k: entry.get(k) for k in ("status", "resumed_at", "attempts")}, ensure_ascii=False) if entry else "无"))
+        if entry.get("status") == "running" and entry.get("pid"):
+            st = monitor_state(entry)
+            print("      监控进程 : pid=%s 状态=%s%s" % (
+                entry["pid"], st, "  ← 等待主循环回收" if st == "zombie" else ""))
+    running = [e for e in (state.get("threads") or {}).values() if e.get("status") == "running"]
+    if running:
+        print("\n运行中的恢复任务：%d 个（并行上限 %s）" % (len(running), cfg.get("max_parallel_resumes")))
+        for tid, e in (state.get("threads") or {}).items():
+            if e.get("status") == "running" and e.get("pid"):
+                print("  %s pid=%s 状态=%s 已运行 %.0f 分钟" % (
+                    tid[:8], e["pid"], monitor_state(e),
+                    (now_ts() - float(e.get("resumed_at") or now_ts())) / 60.0))
+    return 0
+
+
+def acquire_lock():
+    ensure_private_dir(WORK_DIR)
+    fh = open_private(LOCK_PATH, "a")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        print("另一个 codex-quota-resumer 实例已在运行", file=sys.stderr)
+        raise SystemExit(3)
+    except BaseException:
+        fh.close()
+        raise
+    return fh
+
+
+def print_probe(cfg: dict) -> int:
+    print("恢复链路探测：")
+    mode = str(cfg.get("executor") or "auto")
+    print("  配置 executor = %s" % mode)
+    client = AppServerClient(cfg, mode="ws")
+    try:
+        ok = client.start(init_timeout=cfg["rpc_timeout_seconds"])
+        if ok:
+            print("  ✓ daemon 可用（socket=%s）" % client.sock_path)
+            ok2, res = client.call("thread/loaded/list", {}, timeout=30)
+            if ok2:
+                ids = res.get("data", res) if isinstance(res, dict) else res
+                print("  daemon 当前加载的线程: %s" % json.dumps(ids, ensure_ascii=False)[:300])
+            else:
+                print("  thread/loaded/list 失败: %s" % json.dumps(res, ensure_ascii=False)[:200])
+        else:
+            print("  ✗ daemon 不可用: %s" % (client.start_error or "未知"))
+            print("    （挂载了 daemon 的线程将无法续跑；exec 链路仍可用于独立会话）")
+    finally:
+        client.stop()
+    actual = ("daemon" if ok else "exec") if mode == "auto" else mode
+    print("  实际选用: %s" % actual)
+    return 0 if ok else 1
+
+
+def main() -> int:
+    global _LOG_TO_FILE
+    parser = argparse.ArgumentParser(description="Codex 额度恢复器：到点自动续跑被额度中断的会话")
+    parser.add_argument("--once", action="store_true", help="只跑一轮")
+    parser.add_argument("--status", action="store_true", help="打印额度快照与暂停会话")
+    parser.add_argument("--probe", action="store_true", help="探测 daemon 恢复链路是否可用")
+    parser.add_argument("--dry-run", action="store_true", help="只打印将要执行的动作")
+    parser.add_argument("--thread", help="只处理指定 thread id 前缀")
+    parser.add_argument("--force-allowed", action="store_true",
+                        help="模拟额度已恢复（须配合 --dry-run）")
+    # 内部模式：主循环自己拉起，用来在 daemon 上跑一个 turn
+    parser.add_argument("--remote-turn", metavar="THREAD_ID", help=argparse.SUPPRESS)
+    parser.add_argument("--prompt-file", help=argparse.SUPPRESS)
+    parser.add_argument("--cwd", help=argparse.SUPPRESS)
+    parser.add_argument("--failed-turn", help=argparse.SUPPRESS)
+    parser.add_argument("--rollout", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.force_allowed and (not args.dry_run or args.status or args.probe or args.remote_turn):
+        parser.error("--force-allowed 仅可用于 --dry-run 恢复演练")
+    if args.remote_turn and not (args.failed_turn and args.rollout and args.prompt_file):
+        parser.error("恢复任务缺少失败 turn ID、rollout 路径或提示词")
+
+    try:
+        cfg = load_config()
+    except (OSError, ValueError, OverflowError) as exc:
+        print("无法读取配置 %s: %s" % (CONFIG_PATH, exc), file=sys.stderr)
+        return 2
+
+    if args.remote_turn:
+        prompt_path = os.path.abspath(args.prompt_file)
+        try:
+            with open(prompt_path, "r", encoding="utf-8") as fh:
+                prompt = fh.read()
+            if os.path.dirname(prompt_path) == RUNS_DIR and prompt_path.endswith(".log.prompt"):
+                os.unlink(prompt_path)
+        except (OSError, UnicodeError) as exc:
+            print("无法读取恢复提示词: %s" % exc, file=sys.stderr)
+            return 2
+        if not prompt:
+            return 2
+        return run_remote_turn(cfg, args.remote_turn, args.failed_turn, args.rollout,
+                               prompt, args.cwd or HOME)
+
+    if args.status:
+        return print_status(cfg)
+    if args.probe:
+        return print_probe(cfg)
+
+    if args.dry_run or cfg["dry_run"]:
+        return run_loop(cfg, args.once, args.thread, dry_run=True, force_allowed=args.force_allowed)
+    with acquire_lock():
+        secure_runtime_files()
+        if not os.path.exists(CONFIG_PATH):
+            save_json(CONFIG_PATH, DEFAULT_CONFIG)
+        _LOG_TO_FILE = True
+        try:
+            return run_loop(cfg, args.once, args.thread, dry_run=False)
+        finally:
+            _LOG_TO_FILE = False
+
+
+if __name__ == "__main__":
+    sys.exit(main())
